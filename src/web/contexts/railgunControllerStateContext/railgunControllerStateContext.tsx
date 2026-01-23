@@ -375,8 +375,6 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
   const latestBgStateRef = useRef<any>(memoizedBgState)
   const isRunningRef = useRef<boolean>(false) // strict single-flight guard
   const hasLoadedOnceRef = useRef<boolean>(false) // track if we've loaded once on startup
-  const hasAttemptedAutoLoadRef = useRef<boolean>(false) // prevent repeated auto-load attempts on failures
-  const pendingResetRef = useRef<boolean>(false) // defer reset if account/chain changes mid-run
 
   const chainId = memoizedBgState.chainId || DEFAULT_CHAIN_ID;
   
@@ -392,32 +390,8 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
 
   // Reset hasLoadedOnceRef when account or chainId changes (allows loading for new account/chain)
   useEffect(() => {
-    if (isRunningRef.current) {
-      pendingResetRef.current = true
-      console.log('[RailgunContext][Guards] DEFERRED reset (sync in progress)', {
-        isRunningRef: isRunningRef.current,
-        account: selectedAccount?.addr,
-        chainId,
-      })
-      return
-    }
-
     hasLoadedOnceRef.current = false
-    hasAttemptedAutoLoadRef.current = false
-    console.log('[RailgunContext][Guards] RESET for account/chain change', {
-      account: selectedAccount?.addr,
-      chainId,
-      hasLoadedOnce: hasLoadedOnceRef.current,
-      hasAttemptedAutoLoad: hasAttemptedAutoLoadRef.current,
-    })
   }, [selectedAccount?.addr, chainId])
-
-  useEffect(() => {
-    if (isUnlocked) {
-      hasAttemptedAutoLoadRef.current = false
-      console.log('[RailgunContext][Guards] RESET hasAttemptedAutoLoad on unlock')
-    }
-  }, [isUnlocked])
 
   // ───────────────────────────────────────────────────────────────────────────
   // helpers: BG call, wait & getters
@@ -514,43 +488,31 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
   // Core load (single-flight, minimal transitions)
   // ───────────────────────────────────────────────────────────────────────────
   const loadPrivateAccount = useCallback(async (force = false) => {
-    console.log('[RailgunContext][LPA] invoked', { 
-      force,
-      isUnlocked,
-      isRunningRef: isRunningRef.current,
-      status: railgunAccountsState.status,
-      hasLoadedOnce: hasLoadedOnceRef.current,
-      hasSelectedAccount: !!selectedAccount,
-      selectedAccountAddr: selectedAccount?.addr,
-    })
-    
     if (!isUnlocked) {
-      console.log('[RailgunContext][LPA] SKIPPED: keystore is locked (isUnlocked=false)');
+      console.log('[RailgunContext] load skipped — keystore locked');
       return;
     }
     
     // Strict single-flight guard - check and set atomically
     if (isRunningRef.current) {
-      console.log('[RailgunContext][LPA] SKIPPED: sync already in progress (isRunningRef=true)');
+      console.log('[RailgunContext] load skipped — already running (isRunningRef)');
       return;
     }
     if (railgunAccountsState.status === 'running') {
-      console.log('[RailgunContext][LPA] SKIPPED: sync already in progress (status="running")');
+      console.log('[RailgunContext] load skipped — already running (status)');
       return;
     }
 
     // If already loaded once and not forced, skip (only allow manual refresh)
     if (!force && hasLoadedOnceRef.current) {
-      console.log('[RailgunContext][LPA] SKIPPED: already loaded once and force=false (hasLoadedOnce=true). Use refreshPrivateAccount() to reload.');
+      console.log('[RailgunContext] load skipped — already loaded once (use refreshPrivateAccount to reload)');
       return;
     }
 
     if (!selectedAccount) {
-      console.log('[RailgunContext][LPA] SKIPPED: no selected account (selectedAccount=null)')
+      console.log('[RailgunContext] load skipped — no selected account')
       return
     }
-    
-    console.log('[RailgunContext][LPA] STARTING sync for account:', selectedAccount.addr)
 
     // Set running flag immediately to prevent race conditions
     isRunningRef.current = true
@@ -627,10 +589,7 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
             setSyncedDefaultRailgunIndexer(indexer)
           }
         } else {
-          console.log('[RailgunContext - LPA] loading from cache', {
-            lastSyncedBlock: cached.lastSyncedBlock,
-            incompleteLogsBlock: cached.incompleteLogsBlock,
-          })
+          console.log('[RailgunContext - LPA] loading from cache, lastSyncedBlock:', cached.lastSyncedBlock)
 
           indexer = await createRailgunIndexer({
             network: RAILGUN_CONFIG_BY_CHAIN_ID[chainId.toString() as keyof typeof RAILGUN_CONFIG_BY_CHAIN_ID],
@@ -641,18 +600,8 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
             indexer,
             loadState: cached.noteBooks,
           });
+          currentLastSyncedBlock = cached.lastSyncedBlock
           
-          // If there were incomplete logs AND they're ahead of lastSyncedBlock, retry from that block
-          // Otherwise, start from lastSyncedBlock (the incomplete logs were processed in a later run)
-          if (cached.incompleteLogsBlock && cached.incompleteLogsBlock > cached.lastSyncedBlock) {
-            currentLastSyncedBlock = cached.incompleteLogsBlock - 1
-            console.log('[RailgunContext - LPA] retrying from incomplete logs block:', cached.incompleteLogsBlock, '(ahead of lastSyncedBlock:', cached.lastSyncedBlock, ')')
-          } else {
-            currentLastSyncedBlock = cached.lastSyncedBlock
-            if (cached.incompleteLogsBlock) {
-              console.log('[RailgunContext - LPA] ignoring stale incompleteLogsBlock:', cached.incompleteLogsBlock, '(already past lastSyncedBlock:', cached.lastSyncedBlock, ')')
-            }
-          }
         }
 
         console.log('[RailgunContext - LPA] sync account with new logs')
@@ -693,53 +642,25 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
         const toBlock = await provider.getBlockNumber()
         console.log('[RailgunContext - LPA] syncing from block', fromBlock, 'to', toBlock, '(lastSyncedBlock was', currentLastSyncedBlock, ')')
         
-        // Track incomplete logs (missing topics/data)
-        let firstIncompleteLogsBlock: number | undefined = undefined
-        
         // Only fetch logs if we need to (fromBlock <= toBlock)
         if (fromBlock <= toBlock) {
           const logs = await getAllLogs(provider, railgunAddress, fromBlock, toBlock)
           console.log('[RailgunContext - LPA] fetched', logs.length, 'new logs')
           
           if (logs.length > 0) {
-            // Check for incomplete logs and filter them out
-            const completeLogs: RailgunLog[] = []
-            for (const log of logs) {
-              const hasTopics = log.topics && log.topics.length > 0
-              const hasData = log.data && log.data !== '0x' && log.data !== ''
-              
-              if (!hasTopics || !hasData) {
-                const blockNum = Number(log.blockNumber)
-                console.log('[RailgunContext - LPA] incomplete log detected at block:', blockNum, '{ hasTopics:', hasTopics, ', hasData:', hasData, '}')
-                if (firstIncompleteLogsBlock === undefined || blockNum < firstIncompleteLogsBlock) {
-                  firstIncompleteLogsBlock = blockNum
-                }
-                // Skip this log - don't process incomplete logs
-                continue
-              }
-              
-              completeLogs.push({
-                blockNumber: Number(log.blockNumber),
-                topics: [...log.topics],
-                data: log.data,
-                address: log.address,
-              })
-            }
             
-            if (firstIncompleteLogsBlock !== undefined) {
-              console.log('[RailgunContext - LPA] found incomplete logs starting at block:', firstIncompleteLogsBlock, '- will retry on next sync')
-            }
+            const railgunLogs: RailgunLog[] = logs.map((log) => ({
+              blockNumber: Number(log.blockNumber),
+              topics: [...log.topics],
+              data: log.data,
+              address: log.address,
+            }));
+            console.log('[RailgunContext - LPA] processing logs, blockNumbers:', railgunLogs.map(l => l.blockNumber))
+            console.log('[RailgunContext - LPA] processing logs with skipMerkleTree: false (default)')
             
-            if (completeLogs.length > 0) {
-              console.log('[RailgunContext - LPA] processing', completeLogs.length, 'complete logs, blockNumbers:', completeLogs.map(l => l.blockNumber))
-              console.log('[RailgunContext - LPA] processing logs with skipMerkleTree: false (default)')
-              
-              await indexer.processLogs(completeLogs);
-              
-              console.log('[RailgunContext - LPA] account synced with logs')
-            } else {
-              console.log('[RailgunContext - LPA] no complete logs to process (all were incomplete)')
-            }
+            await indexer.processLogs(railgunLogs);
+            
+            console.log('[RailgunContext - LPA] account synced with logs')
           } else {
             console.log('[RailgunContext - LPA] no new logs to process')
           }
@@ -747,31 +668,17 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
           console.log('[RailgunContext - LPA] already synced to latest block, skipping log fetch')
         }
 
-        // Determine the effective lastSyncedBlock:
-        // If we found incomplete logs, only mark as synced up to the block before the first incomplete log
-        // This ensures we'll retry those blocks on next sync
-        const effectiveLastSyncedBlock = firstIncompleteLogsBlock !== undefined 
-          ? firstIncompleteLogsBlock - 1 
-          : toBlock
-        
-        // Always update cache with current state
-        // If no incomplete logs this run, clear any previous incompleteLogsBlock
-        const cacheUpdate = {
-          merkleTrees: indexer.getSerializedState(),
-          noteBooks: account.getSerializedState(),
-          lastSyncedBlock: effectiveLastSyncedBlock,
-          // Explicitly set to undefined to clear previous value if logs are now complete
-          incompleteLogsBlock: firstIncompleteLogsBlock ?? undefined,
-        }
-        console.log('[RailgunContext - LPA] updating account cache', {
-          lastSyncedBlock: effectiveLastSyncedBlock,
-          incompleteLogsBlock: firstIncompleteLogsBlock,
-          clearingIncompleteBlock: firstIncompleteLogsBlock === undefined,
-        })
+        // Always update cache with current state, even if no new logs
+        // This ensures lastSyncedBlock is always up to date
+        console.log('[RailgunContext - LPA] updating account cache, lastSyncedBlock:', toBlock)
         fireBg('RAILGUN_CONTROLLER_SET_ACCOUNT_CACHE', {
           zkAddress,
           chainId,
-          cache: cacheUpdate,
+          cache: {
+            merkleTrees: indexer.getSerializedState(),
+            noteBooks: account.getSerializedState(),
+            lastSyncedBlock: toBlock, // Always use current block as lastSyncedBlock
+          },
         })
 
         // Update stored account instance after sync (only for default account, index 0)
@@ -780,8 +687,8 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
           setSyncedDefaultRailgunIndexer(indexer)
         }
 
-        if (earliestLastSyncedBlock === 0 || effectiveLastSyncedBlock < earliestLastSyncedBlock) {
-          earliestLastSyncedBlock = effectiveLastSyncedBlock
+        if (earliestLastSyncedBlock === 0 || toBlock < earliestLastSyncedBlock) {
+          earliestLastSyncedBlock = toBlock
         }
 
         // NOTE: only works for one native token balancefor now
@@ -890,13 +797,6 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
         status: 'error',
         error: err?.message || String(err),
       }))
-    } finally {
-      if (pendingResetRef.current) {
-        pendingResetRef.current = false
-        hasLoadedOnceRef.current = false
-        hasAttemptedAutoLoadRef.current = false
-        console.log('[RailgunContext][Guards] APPLIED deferred reset (account/chain changed during sync)')
-      }
     }
   }, [selectedAccount, chainId, isUnlocked, railgunAccountsState.status, getDerivedKeysFromBg, getAccountCacheFromBg, fireBg])
 
@@ -905,24 +805,15 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
   // Public refresh: bypasses "already loaded" check and runs immediately
   // ───────────────────────────────────────────────────────────────────────────
   const refreshPrivateAccount = useCallback(async () => {
-    console.log('[RailgunContext][Refresh] invoked', {
-      isRunningRef: isRunningRef.current,
-      status: railgunAccountsState.status,
-    })
-    
     if (isRunningRef.current || railgunAccountsState.status === 'running') {
-      console.log('[RailgunContext][Refresh] SKIPPED: sync already in progress', {
-        isRunningRef: isRunningRef.current,
-        status: railgunAccountsState.status,
-      })
+      console.log('[RailgunContext] refresh skipped — run already in progress')
       return
     }
 
-    console.log('[RailgunContext][Refresh] STARTING forced reload')
+    console.log('[RailgunContext] refreshPrivateAccount called - forcing full reload')
     // Force reload by passing true - this will resync from cache to latest block
     await loadPrivateAccount(true)
-    console.log('[RailgunContext][Refresh] COMPLETED')
-  }, [loadPrivateAccount, railgunAccountsState.status])
+  }, [loadPrivateAccount])
 
   // ───────────────────────────────────────────────────────────────────────────
   // init background controller state if missing
@@ -937,40 +828,11 @@ const RailgunControllerStateProvider: React.FC<any> = ({ children }) => {
   // Auto-load exactly once on startup (when selectedAccount becomes available)
   // ───────────────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const guards = {
-      isUnlocked,
-      hasSelectedAccount: !!selectedAccount,
-      selectedAccountAddr: selectedAccount?.addr,
-      hasLoadedOnce: hasLoadedOnceRef.current,
-      hasAttemptedAutoLoad: hasAttemptedAutoLoadRef.current,
-    }
-    console.log('[RailgunContext][AutoLoad] effect triggered', guards)
-    
-    if (!isUnlocked) {
-      console.log('[RailgunContext][AutoLoad] SKIPPED: keystore locked (isUnlocked=false)')
-      return
-    }
-    if (!selectedAccount) {
-      console.log('[RailgunContext][AutoLoad] SKIPPED: no selected account')
-      return
-    }
-    if (hasLoadedOnceRef.current) {
-      console.log('[RailgunContext][AutoLoad] SKIPPED: already loaded once (hasLoadedOnce=true)')
-      return
-    }
-    if (hasAttemptedAutoLoadRef.current) {
-      console.log('[RailgunContext][AutoLoad] SKIPPED: already attempted (hasAttemptedAutoLoad=true)')
-      return
-    }
+    if (!selectedAccount || hasLoadedOnceRef.current) return
 
-    console.log('[RailgunContext][AutoLoad] SCHEDULING load in 100ms for account:', selectedAccount.addr)
-    const t = setTimeout(() => {
-      console.log('[RailgunContext][AutoLoad] EXECUTING scheduled load')
-      hasAttemptedAutoLoadRef.current = true
-      void loadPrivateAccount(false)
-    }, 100)
+    const t = setTimeout(() => { void loadPrivateAccount(false) }, 100)
     return () => clearTimeout(t)
-  }, [isUnlocked, selectedAccount, loadPrivateAccount])
+  }, [selectedAccount, loadPrivateAccount])
 
   // ───────────────────────────────────────────────────────────────────────────
   // derive “view model” for UI
